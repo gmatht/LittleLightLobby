@@ -37,6 +37,13 @@ try:
 except Exception:
     dwmapi = None
 
+# LRESULT: pointer-sized signed integer used by Win32 APIs. Use a local alias
+# rather than relying on ctypes.wintypes having it defined in all Python builds.
+if ctypes.sizeof(ctypes.c_void_p) == ctypes.sizeof(ctypes.c_long):
+    LRESULT = ctypes.c_long
+else:
+    LRESULT = ctypes.c_longlong
+
 
 # Useful Win32 constants
 WS_POPUP = 0x80000000
@@ -96,7 +103,7 @@ user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LP
 user32.CreateWindowExW.restype = wintypes.HWND
 
 user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-user32.DefWindowProcW.restype = wintypes.LRESULT
+user32.DefWindowProcW.restype = LRESULT
 
 user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
 user32.GetClientRect.restype = wintypes.BOOL
@@ -111,6 +118,12 @@ user32.GetForegroundWindow.restype = wintypes.HWND
 
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+# Some Python builds don't expose all HWND-related types; provide
+# safe fallbacks for HICON/HCURSOR/HBRUSH used by WNDCLASSEX.
+HICON = getattr(wintypes, 'HICON', wintypes.HANDLE)
+HCURSOR = getattr(wintypes, 'HCURSOR', wintypes.HANDLE)
+HBRUSH = getattr(wintypes, 'HBRUSH', wintypes.HANDLE)
 
 
 def find_window_by_title_substring(substring):
@@ -171,13 +184,23 @@ def main():
     target_pid = pid.value
 
     # Window class
-    WNDPROCTYPE = ctypes.WINFUNCTYPE(wintypes.LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    WNDPROCTYPE = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
     class WNDCLASSEX(ctypes.Structure):
-        _fields_ = [('cbSize', wintypes.UINT), ('style', wintypes.UINT), ('lpfnWndProc', WNDPROCTYPE),
-                    ('cbClsExtra', ctypes.c_int), ('cbWndExtra', ctypes.c_int), ('hInstance', wintypes.HINSTANCE),
-                    ('hIcon', wintypes.HICON), ('hCursor', wintypes.HCURSOR), ('hbrBackground', wintypes.HBRUSH),
-                    ('lpszMenuName', wintypes.LPCWSTR), ('lpszClassName', wintypes.LPCWSTR), ('hIconSm', wintypes.HICON)]
+        _fields_ = [
+            ('cbSize', wintypes.UINT),
+            ('style', wintypes.UINT),
+            ('lpfnWndProc', WNDPROCTYPE),
+            ('cbClsExtra', ctypes.c_int),
+            ('cbWndExtra', ctypes.c_int),
+            ('hInstance', wintypes.HINSTANCE),
+            ('hIcon', HICON),
+            ('hCursor', HCURSOR),
+            ('hbrBackground', HBRUSH),
+            ('lpszMenuName', wintypes.LPCWSTR),
+            ('lpszClassName', wintypes.LPCWSTR),
+            ('hIconSm', HICON),
+        ]
 
     hInstance = kernel32.GetModuleHandleW(None)
 
@@ -364,7 +387,7 @@ def main():
     WH_KEYBOARD_LL = 13
     WM_KEYDOWN = 0x0100
 
-    HOOKPROC = ctypes.WINFUNCTYPE(wintypes.LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
     @HOOKPROC
     def keyboard_hook(nCode, wParam, lParam):
