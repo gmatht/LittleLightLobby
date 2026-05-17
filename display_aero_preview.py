@@ -161,6 +161,156 @@ def is_foreground_for_pid(pid):
     return fg_pid.value == pid
 
 
+# Module-level callback types and state for the WndProc and keyboard hook.
+WNDPROCTYPE = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+# Shared mutable state used by the callbacks. main() will populate the
+# hwnd_target and polling intervals before creating the window.
+STATE = {
+    'hthumb': wintypes.HANDLE(0),
+    'thumb_size': (0, 0),
+    'idle': False,
+    'active_interval': 150,
+    'idle_interval': 1000,
+    'hwnd_target': None,
+}
+
+
+def update_thumbnail_props(hwnd, client_w, client_h):
+    """Update the registered DWM thumbnail properties to fit the client rect."""
+    if not STATE.get('hthumb') or not STATE['hthumb'].value:
+        return
+    src_size = STATE.get('thumb_size')
+    if src_size and src_size[0] > 0 and src_size[1] > 0:
+        src_w, src_h = src_size
+        scale = min(client_w / src_w, client_h / src_h)
+        new_w = max(1, int(src_w * scale))
+        new_h = max(1, int(src_h * scale))
+        offset_x = (client_w - new_w) // 2
+        offset_y = (client_h - new_h) // 2
+        left = offset_x
+        top = offset_y
+        right = left + new_w
+        bottom = top + new_h
+    else:
+        left, top, right, bottom = 0, 0, client_w, client_h
+
+    props = DWM_THUMBNAIL_PROPERTIES()
+    props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY
+    props.rcDestination = RECT(left, top, right, bottom)
+    props.opacity = 255
+    props.fVisible = True
+    props.fSourceClientAreaOnly = False
+    try:
+        dwmapi.DwmUpdateThumbnailProperties(STATE['hthumb'], ctypes.byref(props))
+    except Exception:
+        pass
+
+
+@WNDPROCTYPE
+def WndProc(hwnd, msg, wParam, lParam):
+    # Keep this function at module scope (not nested) so ctypes callbacks
+    # don't lose access to globals.
+    if msg == WM_CREATE:
+        hthumb = wintypes.HANDLE()
+        res = dwmapi.DwmRegisterThumbnail(hwnd, STATE['hwnd_target'], ctypes.byref(hthumb))
+        if res != 0 or not hthumb.value:
+            print('DwmRegisterThumbnail failed (HRESULT={})'.format(res))
+            user32.PostQuitMessage(1)
+            return 0
+        STATE['hthumb'] = hthumb
+
+        size = SIZE()
+        res = dwmapi.DwmQueryThumbnailSourceSize(STATE['hthumb'], ctypes.byref(size))
+        if res == 0:
+            STATE['thumb_size'] = (size.cx, size.cy)
+
+        client = RECT()
+        user32.GetClientRect(hwnd, ctypes.byref(client))
+        update_thumbnail_props(hwnd, client.right - client.left, client.bottom - client.top)
+
+        user32.SetTimer(hwnd, 1, STATE['active_interval'], None)
+        return 0
+
+    elif msg == WM_SIZE:
+        client = RECT()
+        user32.GetClientRect(hwnd, ctypes.byref(client))
+        w = client.right - client.left
+        h = client.bottom - client.top
+        update_thumbnail_props(hwnd, w, h)
+        return 0
+
+    elif msg == WM_LBUTTONDOWN:
+        user32.ReleaseCapture()
+        user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+        return 0
+
+    elif msg == WM_TIMER:
+        try:
+            fg = user32.GetForegroundWindow()
+            in_foreground = False
+            if fg:
+                if fg == STATE['hwnd_target']:
+                    in_foreground = True
+                else:
+                    fg_pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+                    in_foreground = (fg_pid.value == STATE.get('target_pid'))
+
+            if in_foreground:
+                if not STATE['idle']:
+                    user32.ShowWindow(hwnd, SW_HIDE)
+                    STATE['idle'] = True
+                    user32.KillTimer(hwnd, 1)
+                    user32.SetTimer(hwnd, 1, STATE['idle_interval'], None)
+            else:
+                if STATE['idle']:
+                    user32.ShowWindow(hwnd, SW_SHOW)
+                    STATE['idle'] = False
+                    user32.KillTimer(hwnd, 1)
+                    user32.SetTimer(hwnd, 1, STATE['active_interval'], None)
+        except Exception:
+            pass
+        return 0
+
+    elif msg == WM_DESTROY:
+        try:
+            if STATE.get('hthumb') and STATE['hthumb'].value:
+                dwmapi.DwmUnregisterThumbnail(STATE['hthumb'])
+        except Exception:
+            pass
+        user32.PostQuitMessage(0)
+        return 0
+
+    elif msg == WM_CLOSE:
+        user32.DestroyWindow(hwnd)
+        return 0
+
+    elif msg == WM_KEYDOWN:
+        if wParam == 0x1B:  # VK_ESCAPE
+            user32.DestroyWindow(hwnd)
+            return 0
+
+    return user32.DefWindowProcW(hwnd, msg, wParam, lParam)
+
+
+@HOOKPROC
+def keyboard_hook(nCode, wParam, lParam):
+    try:
+        if nCode == 0 and wParam == WM_KEYDOWN:
+            kbd = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_uint64)).contents
+            vk = kbd.value & 0xFFFFFFFF
+            if vk == 0x1B:  # ESC
+                # Post close to the window message queue
+                # We don't know the hwnd here; post quit instead
+                user32.PostQuitMessage(0)
+    except Exception:
+        pass
+    return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--title', default='StarCraft II')
@@ -372,8 +522,9 @@ def main():
         print('CreateWindowEx failed')
         sys.exit(1)
 
-    # Make sure window is topmost
-    user32.SetWindowPos(hwnd, -1, x, y, width, height, 0x0001 | 0x0002)
+    # Make sure window is topmost and set requested size/position
+    # Previously used flags that prevented resizing; pass 0 to apply size.
+    user32.SetWindowPos(hwnd, -1, x, y, width, height, 0)
 
     # Show and update
     user32.ShowWindow(hwnd, SW_SHOW)
