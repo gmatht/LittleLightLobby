@@ -65,6 +65,11 @@ WM_QUIT = 0x0012
 
 GWL_EXSTYLE = -20
 WS_EX_TOPMOST = 0x00000008
+HWND_TOPMOST = -1
+# SetWindowPos flags
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_SHOWWINDOW = 0x0040
 
 # DWM flags and structs
 class RECT(ctypes.Structure):
@@ -118,6 +123,43 @@ user32.GetForegroundWindow.restype = wintypes.HWND
 
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+# Additional user32 prototypes used later
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
+
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+user32.SetWindowPos.restype = wintypes.BOOL
+
+user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.PostMessageW.restype = wintypes.BOOL
+
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = wintypes.BOOL
+
+# DWM API prototypes (if available)
+if dwmapi:
+    # HRESULT DwmIsCompositionEnabled(BOOL* pfEnabled)
+    try:
+        dwmapi.DwmIsCompositionEnabled.argtypes = [ctypes.POINTER(wintypes.BOOL)]
+        dwmapi.DwmIsCompositionEnabled.restype = ctypes.c_long
+    except Exception:
+        pass
+    try:
+        # HRESULT DwmRegisterThumbnail(HWND dst, HWND src, PHTHUMBNAIL phThumb)
+        dwmapi.DwmRegisterThumbnail.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.POINTER(wintypes.HANDLE)]
+        dwmapi.DwmRegisterThumbnail.restype = ctypes.c_long
+        # HRESULT DwmUnregisterThumbnail(HTHUMBNAIL hThumb)
+        dwmapi.DwmUnregisterThumbnail.argtypes = [wintypes.HANDLE]
+        dwmapi.DwmUnregisterThumbnail.restype = ctypes.c_long
+        # HRESULT DwmQueryThumbnailSourceSize(HTHUMBNAIL hThumb, PSIZE pSize)
+        dwmapi.DwmQueryThumbnailSourceSize.argtypes = [wintypes.HANDLE, ctypes.POINTER(SIZE)]
+        dwmapi.DwmQueryThumbnailSourceSize.restype = ctypes.c_long
+        # HRESULT DwmUpdateThumbnailProperties(HTHUMBNAIL hThumb, DWM_THUMBNAIL_PROPERTIES* ptnp)
+        dwmapi.DwmUpdateThumbnailProperties.argtypes = [wintypes.HANDLE, ctypes.POINTER(DWM_THUMBNAIL_PROPERTIES)]
+        dwmapi.DwmUpdateThumbnailProperties.restype = ctypes.c_long
+    except Exception:
+        pass
 
 # Some Python builds don't expose all HWND-related types; provide
 # safe fallbacks for HICON/HCURSOR/HBRUSH used by WNDCLASSEX.
@@ -231,6 +273,11 @@ def WndProc(hwnd, msg, wParam, lParam):
         update_thumbnail_props(hwnd, client.right - client.left, client.bottom - client.top)
 
         user32.SetTimer(hwnd, 1, STATE['active_interval'], None)
+        # Ensure the window is topmost once created
+        try:
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        except Exception:
+            pass
         return 0
 
     elif msg == WM_SIZE:
@@ -267,6 +314,11 @@ def WndProc(hwnd, msg, wParam, lParam):
             else:
                 if STATE['idle']:
                     user32.ShowWindow(hwnd, SW_SHOW)
+                    # Restore topmost after showing
+                    try:
+                        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+                    except Exception:
+                        pass
                     STATE['idle'] = False
                     user32.KillTimer(hwnd, 1)
                     user32.SetTimer(hwnd, 1, STATE['active_interval'], None)
@@ -312,6 +364,17 @@ def keyboard_hook(nCode, wParam, lParam):
 
 
 def main():
+    # Support a numeric first positional argument: treat it as height and
+    # remove it from argv so argparse only sees option flags.
+    height_override = None
+    if len(sys.argv) > 1 and not sys.argv[1].startswith('-'):
+        try:
+            height_override = int(sys.argv[1])
+            # remove the numeric arg so argparse doesn't treat it as an unknown
+            del sys.argv[1]
+        except Exception:
+            height_override = None
+
     ap = argparse.ArgumentParser()
     ap.add_argument('--title', default='StarCraft II')
     ap.add_argument('--width', type=int, default=320)
@@ -333,9 +396,27 @@ def main():
     user32.GetWindowThreadProcessId(hwnd_target, ctypes.byref(pid))
     target_pid = pid.value
 
-    # Window class
-    WNDPROCTYPE = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    # If the user passed a standalone numeric first argument, treat it as
+    # height and infer width to preserve the target window's aspect ratio.
+    if height_override is not None:
+        # Query the target window rect to get its aspect ratio
+        rect = RECT()
+        try:
+            if user32.GetWindowRect(hwnd_target, ctypes.byref(rect)):
+                src_w = rect.right - rect.left
+                src_h = rect.bottom - rect.top
+                if src_h > 0 and src_w > 0:
+                    aspect = float(src_w) / float(src_h)
+                    args.height = int(height_override)
+                    args.width = max(1, int(round(args.height * aspect)))
+                    print(f'Inferred width {args.width} from height {args.height} to preserve aspect {aspect:.3f}')
+        except Exception:
+            # If anything fails, just use the provided height and default width
+            args.height = int(height_override)
 
+    # Window class
+    # Reuse the module-scope WNDPROCTYPE to ensure the callback type matches
+    # the WndProc declared earlier and avoid mismatched prototype issues.
     class WNDCLASSEX(ctypes.Structure):
         _fields_ = [
             ('cbSize', wintypes.UINT),
@@ -354,141 +435,12 @@ def main():
 
     hInstance = kernel32.GetModuleHandleW(None)
 
-    # We'll keep a few variables in an outer scope so the WndProc can access them
-    state = {
-        'hthumb': wintypes.HANDLE(0),
-        'thumb_size': (0, 0),
-        'idle': False,
-        'active_interval': args.interval,
-        'idle_interval': args.idle_interval,
-        'hwnd_target': hwnd_target,
-    }
-
-    # Define WndProc
-    @WNDPROCTYPE
-    def WndProc(hwnd, msg, wParam, lParam):
-        if msg == WM_CREATE:
-            # Register DWM thumbnail now that the window exists and is visible
-            # (we assume the caller will ShowWindow before creating a timer)
-            hthumb = wintypes.HANDLE()
-            res = dwmapi.DwmRegisterThumbnail(hwnd, state['hwnd_target'], ctypes.byref(hthumb))
-            if res != 0 or not hthumb.value:
-                print('DwmRegisterThumbnail failed (HRESULT={})'.format(res))
-                # signal exit
-                user32.PostQuitMessage(1)
-                return 0
-            state['hthumb'] = hthumb
-
-            # Query source size
-            size = SIZE()
-            res = dwmapi.DwmQueryThumbnailSourceSize(state['hthumb'], ctypes.byref(size))
-            if res == 0:
-                state['thumb_size'] = (size.cx, size.cy)
-
-            # Initial props
-            client = RECT()
-            user32.GetClientRect(hwnd, ctypes.byref(client))
-            update_thumbnail_props(hwnd, client.right - client.left, client.bottom - client.top)
-
-            # Start timer (active interval)
-            user32.SetTimer(hwnd, 1, state['active_interval'], None)
-            return 0
-
-        elif msg == WM_SIZE:
-            # Update destination rectangle to preserve aspect
-            width = ctypes.c_int(wParam & 0xFFFF).value if False else None
-            client = RECT()
-            user32.GetClientRect(hwnd, ctypes.byref(client))
-            w = client.right - client.left
-            h = client.bottom - client.top
-            update_thumbnail_props(hwnd, w, h)
-            return 0
-
-        elif msg == WM_LBUTTONDOWN:
-            # Allow the user to drag the window by sending a non-client click
-            user32.ReleaseCapture()
-            user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
-            return 0
-
-        elif msg == WM_TIMER:
-            # Foreground polling and idle handling
-            try:
-                fg = user32.GetForegroundWindow()
-                in_foreground = False
-                if fg:
-                    if fg == state['hwnd_target']:
-                        in_foreground = True
-                    else:
-                        fg_pid = wintypes.DWORD()
-                        user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
-                        in_foreground = (fg_pid.value == target_pid)
-
-                if in_foreground:
-                    # if target is foreground and we're not idle, hide and slow polling
-                    if not state['idle']:
-                        user32.ShowWindow(hwnd, SW_HIDE)
-                        state['idle'] = True
-                        user32.KillTimer(hwnd, 1)
-                        user32.SetTimer(hwnd, 1, state['idle_interval'], None)
-                else:
-                    # target not foreground
-                    if state['idle']:
-                        user32.ShowWindow(hwnd, SW_SHOW)
-                        state['idle'] = False
-                        user32.KillTimer(hwnd, 1)
-                        user32.SetTimer(hwnd, 1, state['active_interval'], None)
-                    # no other per-frame work required; DWM draws the thumbnail
-            except Exception:
-                pass
-            return 0
-
-        elif msg == WM_DESTROY:
-            # Unregister thumbnail and stop
-            try:
-                if state.get('hthumb') and state['hthumb'].value:
-                    dwmapi.DwmUnregisterThumbnail(state['hthumb'])
-            except Exception:
-                pass
-            user32.PostQuitMessage(0)
-            return 0
-
-        elif msg == WM_CLOSE:
-            user32.DestroyWindow(hwnd)
-            return 0
-
-        elif msg == WM_KEYDOWN:
-            if wParam == 0x1B:  # VK_ESCAPE
-                user32.DestroyWindow(hwnd)
-                return 0
-
-        return user32.DefWindowProcW(hwnd, msg, wParam, lParam)
-
-    # Helper: update thumbnail props given client size
-    def update_thumbnail_props(hwnd, client_w, client_h):
-        if not state.get('hthumb') or not state['hthumb'].value:
-            return
-        src_size = state.get('thumb_size')
-        if src_size and src_size[0] > 0 and src_size[1] > 0:
-            src_w, src_h = src_size
-            scale = min(client_w / src_w, client_h / src_h)
-            new_w = max(1, int(src_w * scale))
-            new_h = max(1, int(src_h * scale))
-            offset_x = (client_w - new_w) // 2
-            offset_y = (client_h - new_h) // 2
-            left = offset_x
-            top = offset_y
-            right = left + new_w
-            bottom = top + new_h
-        else:
-            left, top, right, bottom = 0, 0, client_w, client_h
-
-        props = DWM_THUMBNAIL_PROPERTIES()
-        props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY
-        props.rcDestination = RECT(left, top, right, bottom)
-        props.opacity = 255
-        props.fVisible = True
-        props.fSourceClientAreaOnly = False
-        dwmapi.DwmUpdateThumbnailProperties(state['hthumb'], ctypes.byref(props))
+    # Configure the module-level STATE used by the callbacks
+    STATE['active_interval'] = args.interval
+    STATE['idle_interval'] = args.idle_interval
+    STATE['hwnd_target'] = hwnd_target
+    STATE['target_pid'] = target_pid
+    STATE['idle'] = False
 
     # Register a window class
     wndclass = WNDCLASSEX()
@@ -516,6 +468,8 @@ def main():
     height = args.height
     x = 100
     y = 100
+    # Use WS_POPUP | WS_VISIBLE to create a borderless visible window. We'll
+    # make it topmost below using SetWindowPos.
     hwnd = user32.CreateWindowExW(0, class_name, 'AeroPreview', WS_POPUP | WS_VISIBLE,
                                    x, y, width, height, None, None, hInstance, None)
     if not hwnd:
@@ -523,8 +477,8 @@ def main():
         sys.exit(1)
 
     # Make sure window is topmost and set requested size/position
-    # Previously used flags that prevented resizing; pass 0 to apply size.
-    user32.SetWindowPos(hwnd, -1, x, y, width, height, 0)
+    # Use HWND_TOPMOST and SWP_SHOWWINDOW so the window becomes topmost.
+    user32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW)
 
     # Show and update
     user32.ShowWindow(hwnd, SW_SHOW)
