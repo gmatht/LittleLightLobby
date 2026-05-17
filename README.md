@@ -1,5 +1,16 @@
 # StarCraft II Live Thumbnail
 
+If your party leader spends a long time picking a map you may be tempted to do something else,
+but then you may not see the invite and they may end up waiting for you instead.
+So I thought, what if we have a thumbnail showing your StarCraft Window so you can immediately see the invite without StarCraft taking up your whole screen? 
+
+I have tried a number of approaches. Aero works best for me.
+None of them seem to work if StarCraft is true FullScreen (Windowed-Fullscreen is fine).
+
+This script may also be useful for other games that have an in-game lobby/invite system.
+
+## Files
+
 This folder contains small utilities to show a live thumbnail preview of the
 StarCraft II window. The fastest method uses the Windows DWM (Aero) thumbnail
 API so the compositor renders a live low-CPU preview.
@@ -18,7 +29,9 @@ Quick overview
 - test_screencapture_variance.py — diagnostic script to measure capture
   brightness/variance and help choose a fallback.
 
-Usage (fast Aero preview)
+
+## Usage (fast Aero preview)
+
 - Run on Windows (needs DWM / dwmapi):
   `python display_aero_preview.py [HEIGHT] [--title "StarCraft II"] [--width W] [--height H]`
 
@@ -48,7 +61,3 @@ Saved captures
 - When run, some scripts write sample captures to files named
   `sc_capture.bmp` and `sc_capture_window.bmp` in this directory for
   debugging.
-
-If you want, I can also add usage examples, copyable command lines, or
-improve troubleshooting diagnostics (HRESULT decoding for DwmRegisterThumbnail,
-etc.).
