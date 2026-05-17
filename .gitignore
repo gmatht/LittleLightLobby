@@ -1,0 +1,9 @@
+# Ignore generated images and Python cache
+sc_capture*.bmp
+*.bmp
+__pycache__/
+*.py[cod]
+
+# Editor/project files
+.vscode/
+.idea/
