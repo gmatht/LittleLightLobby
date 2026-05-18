@@ -51,6 +51,7 @@ WS_VISIBLE = 0x10000000
 WS_OVERLAPPED = 0x00000000
 SW_SHOW = 5
 SW_HIDE = 0
+SW_RESTORE = 9
 HTCAPTION = 2
 WM_CREATE = 0x0001
 WM_DESTROY = 0x0002
@@ -58,10 +59,17 @@ WM_SIZE = 0x0005
 WM_TIMER = 0x0113
 WM_CLOSE = 0x0010
 WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONDBLCLK = 0x0203
 WM_KEYDOWN = 0x0100
 WM_NCLBUTTONDOWN = 0x00A1
 WM_PAINT = 0x000F
 WM_QUIT = 0x0012
+
+WM_SETCURSOR = 0x0020
+
+# Common cursor and class style constants
+IDC_ARROW = 32512
+CS_DBLCLKS = 0x0008
 
 GWL_EXSTYLE = -20
 WS_EX_TOPMOST = 0x00000008
@@ -136,6 +144,39 @@ user32.PostMessageW.restype = wintypes.BOOL
 
 user32.IsWindow.argtypes = [wintypes.HWND]
 user32.IsWindow.restype = wintypes.BOOL
+
+# Additional prototypes used for raising/activating the target window
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.AttachThreadInput.restype = wintypes.BOOL
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = wintypes.BOOL
+user32.SetFocus.argtypes = [wintypes.HWND]
+user32.SetFocus.restype = wintypes.HWND
+
+# Prototypes for window activation/foreground raising
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
+user32.SetActiveWindow.argtypes = [wintypes.HWND]
+user32.SetActiveWindow.restype = wintypes.HWND
+user32.BringWindowToTop.argtypes = [wintypes.HWND]
+user32.BringWindowToTop.restype = wintypes.BOOL
+try:
+    # LoadCursorW can be called without strict argtypes; set restype so we
+    # get a proper handle. Use this to set a normal arrow cursor for the
+    # preview window so it doesn't show a busy cursor.
+    user32.LoadCursorW.restype = HCURSOR
+except Exception:
+    pass
+try:
+    user32.SetCursor.argtypes = [HCURSOR]
+    user32.SetCursor.restype = HCURSOR
+except Exception:
+    pass
 
 # DWM API prototypes (if available)
 if dwmapi:
@@ -250,6 +291,113 @@ def update_thumbnail_props(hwnd, client_w, client_h):
         pass
 
 
+def raise_target_window(hwnd_target):
+    """Attempt to restore and bring the target window to the foreground.
+
+    Uses AttachThreadInput when necessary to work around SetForegroundWindow
+    restrictions. Best-effort and silently returns on failure.
+    """
+    try:
+        if not hwnd_target:
+            return False
+        if not user32.IsWindow(hwnd_target):
+            return False
+
+        # If minimized, restore first
+        try:
+            if user32.IsIconic(hwnd_target):
+                user32.ShowWindow(hwnd_target, SW_RESTORE)
+        except Exception:
+            pass
+
+        # First attempt: attach both the foreground thread and target thread
+        # to our thread (best-effort), then call SetForegroundWindow.
+        try:
+            fg = user32.GetForegroundWindow()
+            dummy = wintypes.DWORD()
+            targ_proc = wintypes.DWORD()
+            target_tid = user32.GetWindowThreadProcessId(hwnd_target, ctypes.byref(targ_proc))
+            fg_tid = 0
+            if fg:
+                fg_tid = user32.GetWindowThreadProcessId(fg, ctypes.byref(dummy))
+
+            cur_tid = kernel32.GetCurrentThreadId()
+            attached_fg = False
+            attached_targ = False
+            try:
+                if fg and fg_tid != cur_tid:
+                    attached_fg = user32.AttachThreadInput(fg_tid, cur_tid, True)
+            except Exception:
+                attached_fg = False
+
+            try:
+                if target_tid != cur_tid:
+                    attached_targ = user32.AttachThreadInput(target_tid, cur_tid, True)
+            except Exception:
+                attached_targ = False
+
+            try:
+                user32.SetForegroundWindow(hwnd_target)
+                user32.BringWindowToTop(hwnd_target)
+                user32.SetActiveWindow(hwnd_target)
+                try:
+                    user32.SetFocus(hwnd_target)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if attached_targ:
+                        user32.AttachThreadInput(target_tid, cur_tid, False)
+                except Exception:
+                    pass
+                try:
+                    if attached_fg:
+                        user32.AttachThreadInput(fg_tid, cur_tid, False)
+                except Exception:
+                    pass
+
+            # Check if we succeeded
+            try:
+                if user32.GetForegroundWindow() == hwnd_target:
+                    return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Second attempt: try the legacy SwitchToThisWindow if available.
+        try:
+            switch = getattr(user32, 'SwitchToThisWindow', None)
+            if switch:
+                try:
+                    # Some versions expect BOOL second arg
+                    switch(hwnd_target, True)
+                except Exception:
+                    try:
+                        switch(hwnd_target, 1)
+                    except Exception:
+                        pass
+                # If that didn't make it foreground, fall through
+                if user32.GetForegroundWindow() == hwnd_target:
+                    return True
+        except Exception:
+            pass
+
+        # Last-ditch: try making it topmost briefly and then focus it.
+        try:
+            user32.SetWindowPos(hwnd_target, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            user32.SetForegroundWindow(hwnd_target)
+            user32.SetWindowPos(hwnd_target, -2, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+            if user32.GetForegroundWindow() == hwnd_target:
+                return True
+        except Exception:
+            pass
+
+        return False
+    except Exception:
+        return False
+
+
 @WNDPROCTYPE
 def WndProc(hwnd, msg, wParam, lParam):
     # Keep this function at module scope (not nested) so ctypes callbacks
@@ -291,6 +439,14 @@ def WndProc(hwnd, msg, wParam, lParam):
     elif msg == WM_LBUTTONDOWN:
         user32.ReleaseCapture()
         user32.SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+        return 0
+
+    elif msg == WM_LBUTTONDBLCLK:
+        try:
+            # Raise/activate the target window on double-click
+            raise_target_window(STATE.get('hwnd_target'))
+        except Exception:
+            pass
         return 0
 
     elif msg == WM_TIMER:
@@ -445,13 +601,21 @@ def main():
     # Register a window class
     wndclass = WNDCLASSEX()
     wndclass.cbSize = ctypes.sizeof(WNDCLASSEX)
-    wndclass.style = 0
+    # Enable double-click messages and set a normal arrow cursor to avoid a
+    # busy/working cursor showing over the preview.
+    try:
+        wndclass.style = CS_DBLCLKS
+    except Exception:
+        wndclass.style = 0
     wndclass.lpfnWndProc = WndProc
     wndclass.cbClsExtra = 0
     wndclass.cbWndExtra = 0
     wndclass.hInstance = hInstance
     wndclass.hIcon = None
-    wndclass.hCursor = None
+    try:
+        wndclass.hCursor = user32.LoadCursorW(None, IDC_ARROW)
+    except Exception:
+        wndclass.hCursor = None
     wndclass.hbrBackground = None
     wndclass.lpszMenuName = None
     class_name = 'AeroThumbClass'
